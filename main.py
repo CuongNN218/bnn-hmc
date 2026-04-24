@@ -8,15 +8,14 @@ BNN-HMC on the TMDB 5000 Movies dataset, following the preprocessing of
     https://www.maths.dur.ac.uk/users/viet.c.nguyen/MATH3431/Practicals/Practical_3.html
  
 Task: predict `vote_average` from 5 features (budget, popularity, revenue,
-runtime, vote_count).  Preprocessing (exactly per the practical):
+runtime, vote_count).  Preprocessing:
   * keep 6 columns: budget, popularity, revenue, runtime, vote_average,
     vote_count
   * drop rows with NA runtime
-  * 60 / 20 / 20 train / val / test split (deterministic with --seed)
-  * Min-Max scale each column to [0, 1] using the TRAINING set ranges
-    (fit on train, apply to val/test)
-  * The target we learn is the *scaled* vote_average; MSE is reported in
-    both scaled and unscaled space.
+  * drop rows with budget == 0 or revenue == 0 (missing-data sentinel)
+  * 80 / 20 train / test split (deterministic with --seed)
+  * keep the original units for both inputs and target; MSE is reported
+    on the raw vote_average scale.
  
 Architecture: a shallow BNN [5, hidden, 1] with Gaussian prior and Gaussian
 likelihood (noise_scale fixed).  Hidden defaults to 50 (lit. standard).
@@ -75,6 +74,9 @@ ACTIVATIONS = {
     "relu":          lambda x: jax.nn.relu(x),
     "gelu":          lambda x: jax.nn.gelu(x),
     "swish":         lambda x: x * jax.nn.sigmoid(x),
+    "mish":          lambda x: x * jax.nn.tanh(jax.nn.softplus(x)),
+    "softplus":      lambda x: jax.nn.softplus(x),
+    "leaky_relu":    lambda x: jax.nn.leaky_relu(x),
 }
  
  
@@ -235,65 +237,58 @@ def download_tmdb(cache_path):
  
  
 def load_tmdb(data_dir="./data", seed=0):
-    """Return (X_tr, y_tr, X_val, y_val, X_te, y_te, pp) in scaled space,
-    plus `pp` (min/max per column) so we can un-scale predictions later.
- 
-    The pipeline mirrors the practical:
+    """Return z-normalised (X_tr, y_tr, X_te, y_te, scaler, features).
+
+    The pipeline:
       1. read CSV
       2. keep the 6 columns
       3. drop NA runtime rows
-      4. 60/20/20 split with `seed`
-      5. fit min-max on train, apply to val + test
+      4. drop rows with budget == 0 or revenue == 0 (missing-data sentinel)
+      5. 80/20 train/test split with `seed`
+      6. z-normalise each feature and the target using training statistics
+         (mean and std fit on train, applied to test)
     """
     path = download_tmdb(os.path.join(data_dir, "tmdb_5000_movies.csv"))
     df = pd.read_csv(path)
     df = df[KEEP_COLS].dropna(subset=["runtime"]).reset_index(drop=True)
- 
-    # 60/20/20 split
+    df = df[(df["budget"] != 0) & (df["revenue"] != 0)].reset_index(drop=True)
+
+    # 80/20 split
     rng = np.random.RandomState(seed)
     idx = rng.permutation(len(df))
-    n       = len(df)
-    n_tr    = int(0.6 * n)
-    n_val   = int(0.2 * n)
-    tr_idx  = idx[:n_tr]
-    val_idx = idx[n_tr:n_tr + n_val]
-    te_idx  = idx[n_tr + n_val:]
-    df_tr, df_val, df_te = df.iloc[tr_idx], df.iloc[val_idx], df.iloc[te_idx]
- 
-    # Min-Max scaler fit on training data only
-    x_min = df_tr.min(axis=0).values.astype(np.float32)
-    x_max = df_tr.max(axis=0).values.astype(np.float32)
-    rng_span = np.where((x_max - x_min) == 0, 1.0, x_max - x_min)
- 
-    def scale(d):
-        arr = d[KEEP_COLS].values.astype(np.float32)
-        return (arr - x_min) / rng_span
- 
-    s_tr, s_val, s_te = scale(df_tr), scale(df_val), scale(df_te)
- 
+    n      = len(df)
+    n_tr   = int(0.8 * n)
+    tr_idx = idx[:n_tr]
+    te_idx = idx[n_tr:]
+    df_tr, df_te = df.iloc[tr_idx], df.iloc[te_idx]
+
     tgt_idx = KEEP_COLS.index(TARGET_COL)
     feat_idx = [i for i in range(len(KEEP_COLS)) if i != tgt_idx]
- 
-    X_tr,  y_tr  = s_tr[:,  feat_idx], s_tr[:,  tgt_idx].reshape(-1, 1)
-    X_val, y_val = s_val[:, feat_idx], s_val[:, tgt_idx].reshape(-1, 1)
-    X_te,  y_te  = s_te[:,  feat_idx], s_te[:,  tgt_idx].reshape(-1, 1)
- 
-    pp = {
-        "x_min":    x_min,
-        "x_max":    x_max,
-        "tgt_idx":  tgt_idx,
-        "tgt_min":  float(x_min[tgt_idx]),
-        "tgt_max":  float(x_max[tgt_idx]),
-        "features": [KEEP_COLS[i] for i in feat_idx],
-    }
-    print(f"[data] total={n}  train={len(X_tr)}  val={len(X_val)}  "
-          f"test={len(X_te)}  features={pp['features']}  target={TARGET_COL}")
-    return X_tr, y_tr, X_val, y_val, X_te, y_te, pp
- 
- 
-def unscale(scaled, pp):
-    """Undo min-max on the target column."""
-    return scaled * (pp["tgt_max"] - pp["tgt_min"]) + pp["tgt_min"]
+    features = [KEEP_COLS[i] for i in feat_idx]
+
+    arr_tr = df_tr[KEEP_COLS].values.astype(np.float32)
+    arr_te = df_te[KEEP_COLS].values.astype(np.float32)
+
+    X_tr, y_tr = arr_tr[:, feat_idx], arr_tr[:, tgt_idx].reshape(-1, 1)
+    X_te, y_te = arr_te[:, feat_idx], arr_te[:, tgt_idx].reshape(-1, 1)
+
+    # Z-normalisation — fit on train only
+    X_mu    = X_tr.mean(axis=0)
+    X_sigma = X_tr.std(axis=0)
+    X_sigma = np.where(X_sigma == 0, 1.0, X_sigma)
+    y_mu    = float(y_tr.mean())
+    y_sigma = float(y_tr.std()) or 1.0
+
+    X_tr = (X_tr - X_mu) / X_sigma
+    X_te = (X_te - X_mu) / X_sigma
+    y_tr = (y_tr - y_mu) / y_sigma
+    y_te = (y_te - y_mu) / y_sigma
+
+    scaler = {"y_mu": y_mu, "y_sigma": y_sigma}
+
+    print(f"[data] total={n}  train={len(X_tr)}  test={len(X_te)}  "
+          f"features={features}  target={TARGET_COL}")
+    return X_tr, y_tr, X_te, y_te, scaler, features
  
  
 # =============================================================================
@@ -309,19 +304,21 @@ def num_steps_from_T(T, eps):
     return L, eps * L
  
  
-def evaluate(bnn, samples, X, y_scaled, pp):
-    """Compute scaled MSE and unscaled MSE on a dataset."""
+def evaluate(bnn, samples, X, y, scaler):
+    """Return (mse_normalised, mse_original) on a dataset."""
     if len(samples) == 0:
         return float("nan"), float("nan")
     preds = bnn.predict(samples, jnp.asarray(X))
-    preds = np.asarray(preds).squeeze(-1).mean(axis=0)   # [N]
-    y_flat = y_scaled.squeeze(-1)
-    mse_scaled   = float(np.mean((preds - y_flat) ** 2))
-    mse_unscaled = float(np.mean((unscale(preds, pp) - unscale(y_flat, pp)) ** 2))
-    return mse_scaled, mse_unscaled
- 
- 
-def one_run(bnn, X_tr, y_tr, X_te, y_te, pp, *,
+    preds  = np.asarray(preds).squeeze(-1).mean(axis=0)  # [N]
+    y_flat = y.squeeze(-1)
+    mse_norm = float(np.mean((preds - y_flat) ** 2))
+    preds_orig = preds  * scaler["y_sigma"] + scaler["y_mu"]
+    y_orig     = y_flat * scaler["y_sigma"] + scaler["y_mu"]
+    mse_orig   = float(np.mean((preds_orig - y_orig) ** 2))
+    return mse_norm, mse_orig
+
+
+def one_run(bnn, X_tr, y_tr, X_te, y_te, scaler, *,
             n_samples, burn_in, num_steps, step_size, seed):
     t0 = time.time()
     samples, acc_rate, deltaHs, term1s, acc_flags = bnn.hmc_sampling(
@@ -333,29 +330,28 @@ def one_run(bnn, X_tr, y_tr, X_te, y_te, pp, *,
     deltaHs = np.asarray(deltaHs)
     term1s  = np.asarray(term1s)
     term2s  = term1s - deltaHs
-    mse_s, mse_u = evaluate(bnn, samples, X_te, y_te, pp)
+    mse_norm, mse_orig = evaluate(bnn, samples, X_te, y_te, scaler)
     return {
-        "samples":   samples,
-        "accepted":  acc_flags,
+        "samples":    samples,
+        "accepted":   acc_flags,
         "accept_rate": float(acc_rate),
-        "deltaH":    deltaHs,
-        "term_1":    term1s,
-        "term_2":    term2s,
-        "mse_scaled":   mse_s,
-        "mse_unscaled": mse_u,
-        "wall_s":    wall,
+        "deltaH":     deltaHs,
+        "term_1":     term1s,
+        "term_2":     term2s,
+        "mse_norm":   mse_norm,
+        "mse_orig":   mse_orig,
+        "wall_s":     wall,
     }
  
  
-def run_sweep(X_tr, y_tr, X_val, y_val, pp, *, hidden, activations, step_sizes,
+def run_sweep(X_tr, y_tr, X_te, y_te, scaler, *, hidden, activations, step_sizes,
               trajectory_length, n_samples, burn_in, prior_variance,
               noise_scale, seed, out_dir):
-    """Sweep (activation x step_size); evaluate on the *validation* set
-    (good practice -- reserve the test set for a final comparison)."""
+    """Sweep (activation x step_size); evaluate on the test set."""
     input_dim = X_tr.shape[1]
     print(f"[sweep] input_dim={input_dim}  hidden={hidden}  "
-          f"n_train={len(X_tr)}  n_val={len(X_val)}")
- 
+          f"n_train={len(X_tr)}  n_test={len(X_te)}")
+
     rows = []
     for act in activations:
         bnn = build_bnn(input_dim, hidden, act, prior_variance, noise_scale)
@@ -364,7 +360,7 @@ def run_sweep(X_tr, y_tr, X_val, y_val, pp, *, hidden, activations, step_sizes,
             print(f"[sweep] activation={act}  eps={eps:g}  L={L}  "
                   f"T_target={trajectory_length:g}  T_actual={T_actual:g}")
             try:
-                res = one_run(bnn, X_tr, y_tr, X_val, y_val, pp,
+                res = one_run(bnn, X_tr, y_tr, X_te, y_te, scaler,
                               n_samples=n_samples, burn_in=burn_in,
                               num_steps=L, step_size=eps, seed=seed)
             except Exception as e:
@@ -384,13 +380,13 @@ def run_sweep(X_tr, y_tr, X_val, y_val, pp, *, hidden, activations, step_sizes,
                 "std_deltaH":    float(np.std(res["deltaH"])),
                 "std_term_1":    float(np.std(res["term_1"])),
                 "std_term_2":    float(np.std(res["term_2"])),
-                "val_mse_scaled":   res["mse_scaled"],
-                "val_mse_unscaled": res["mse_unscaled"],
+                "test_mse_norm": res["mse_norm"],
+                "test_mse_orig": res["mse_orig"],
                 "wall_s":        res["wall_s"],
             }
             print(f"  accept={row['accept_rate']:.3f}  "
                   f"eff={row['efficiency']:.4g}  "
-                  f"val_mse(scaled)={row['val_mse_scaled']:.4g}")
+                  f"test_mse_orig={row['test_mse_orig']:.4g}")
             rows.append(row)
  
             hist = pd.DataFrame({
@@ -403,7 +399,7 @@ def run_sweep(X_tr, y_tr, X_val, y_val, pp, *, hidden, activations, step_sizes,
                         f"tmdb_hist_{act}_eps{eps:g}.csv"), index=False)
  
     df = pd.DataFrame(rows)
-    out_path = os.path.join(out_dir, "tmdb_sweep_summary.csv")
+    out_path = os.path.join(out_dir, f"tmdb_sweep_summary_{seed}.csv")
     df.to_csv(out_path, index=False)
     print(f"[sweep] summary saved to {out_path}")
     return df
@@ -536,11 +532,11 @@ def main():
     print(f"[jax] version: {jax.__version__}  "
           f"backend: {jax.default_backend()}  devices: {jax.devices()}")
  
-    X_tr, y_tr, X_val, y_val, X_te, y_te, pp = load_tmdb(
+    X_tr, y_tr, X_te, y_te, scaler, features = load_tmdb(
         data_dir=args.data_dir, seed=args.seed)
- 
+
     if args.sweep:
-        df = run_sweep(X_tr, y_tr, X_val, y_val, pp,
+        df = run_sweep(X_tr, y_tr, X_te, y_te, scaler,
                        hidden=args.hidden,
                        activations=args.activations,
                        step_sizes=args.step_sizes,
@@ -568,10 +564,10 @@ def main():
           f"eps={args.step_size:g}  L={L}  T_actual={T_actual:g}")
  
     # evaluate on the *test* set for single-run mode
-    res = one_run(bnn, X_tr, y_tr, X_te, y_te, pp,
+    res = one_run(bnn, X_tr, y_tr, X_te, y_te, scaler,
                   n_samples=args.n_samples, burn_in=args.burn_in,
                   num_steps=L, step_size=args.step_size, seed=args.seed)
- 
+
     print("\n================= Results =================")
     print(f" activation:        {args.activation}")
     print(f" architecture:      {bnn.layer_sizes}")
@@ -582,8 +578,8 @@ def main():
     print(f" mean deltaH:       {np.mean(res['deltaH']):+.4f}")
     print(f" mean term_1:       {np.mean(res['term_1']):+.4f}")
     print(f" mean term_2:       {np.mean(res['term_2']):+.4f}")
-    print(f" test MSE (scaled): {res['mse_scaled']:.4g}")
-    print(f" test MSE (unscaled): {res['mse_unscaled']:.4g}")
+    print(f" test MSE (norm):   {res['mse_norm']:.4g}")
+    print(f" test MSE (orig):   {res['mse_orig']:.4g}")
     print(f" wall time:         {res['wall_s']:.1f}s")
  
     pd.DataFrame({

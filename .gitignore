@@ -6,6 +6,11 @@ dist/
 wheels/
 *.egg-info
 
+.claude/
+data/
+results_tmdb.zip
+results_tmdb/
+
 _pycache__/
 *.py[cod]
 *$py.class
